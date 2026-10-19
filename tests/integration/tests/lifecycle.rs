@@ -1019,3 +1019,108 @@ fn test_partial_repayment_then_default_pool_loss_calculation() {
     let returned = pool.withdraw(&lp, &shares);
     assert_eq!(returned, deposit_amount - expected_loss);
 }
+
+// Issue #103: a paused dependency must roll back the entire outer transaction.
+#[test]
+fn test_paused_funding_dependency_rolls_back_then_allows_retry() {
+    use soroban_sdk::testutils::Events;
+    for pause_invoice in [false, true] {
+        let lifecycle = setup_fee_lifecycle();
+        lifecycle.pool.deposit(&lifecycle.lp, &12_000_000_000);
+        let invoice_id = lifecycle.invoice.create(
+            &lifecycle.issuer,
+            &lifecycle.buyer,
+            &10_000_000_000,
+            &(lifecycle.env.ledger().timestamp() + 30 * 86400),
+            &lifecycle.usdc_id,
+        );
+        attest_invoice(&lifecycle.env, &lifecycle.invoice, &invoice_id);
+        lifecycle.invoice.list_for_financing(&invoice_id, &200);
+        let escrow = EscrowContractClient::new(&lifecycle.env, &lifecycle.escrow_id);
+        let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+        if pause_invoice {
+            lifecycle.invoice.pause();
+        } else {
+            escrow.pause();
+        }
+        let stats = lifecycle.pool.get_stats().to_xdr(&lifecycle.env);
+        let invoice = lifecycle.invoice.get(&invoice_id).to_xdr(&lifecycle.env);
+        let pool_balance = token.balance(&lifecycle.pool_id);
+        let escrow_balance = token.balance(&lifecycle.escrow_id);
+        let event_count = lifecycle.env.events().all().len();
+        assert!(lifecycle.pool.try_fund_invoice(&invoice_id).is_err());
+        assert_eq!(lifecycle.pool.get_stats().to_xdr(&lifecycle.env), stats);
+        assert_eq!(
+            lifecycle.invoice.get(&invoice_id).to_xdr(&lifecycle.env),
+            invoice
+        );
+        assert_eq!(token.balance(&lifecycle.pool_id), pool_balance);
+        assert_eq!(token.balance(&lifecycle.escrow_id), escrow_balance);
+        assert_eq!(escrow.get_locked(&invoice_id), 0);
+        assert_eq!(lifecycle.env.events().all().len(), event_count);
+        if pause_invoice {
+            lifecycle.invoice.unpause();
+        } else {
+            escrow.unpause();
+        }
+        assert!(lifecycle.pool.fund_invoice(&invoice_id));
+        assert_eq!(
+            lifecycle.invoice.get_status(&invoice_id),
+            InvoiceStatus::Funded as u32
+        );
+        assert_eq!(escrow.get_locked(&invoice_id), 9_800_000_000);
+    }
+}
+
+#[test]
+fn test_paused_repayment_dependency_rolls_back_then_allows_retry() {
+    use soroban_sdk::testutils::Events;
+    for pause_pool in [false, true] {
+        let lifecycle = setup_fee_lifecycle();
+        lifecycle.pool.deposit(&lifecycle.lp, &12_000_000_000);
+        let (invoice_id, due_date) = create_fee_lifecycle_invoice(&lifecycle);
+        lifecycle.env.ledger().set_timestamp(due_date);
+        let escrow = EscrowContractClient::new(&lifecycle.env, &lifecycle.escrow_id);
+        let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+        if pause_pool {
+            lifecycle.pool.pause();
+        } else {
+            escrow.pause();
+        }
+        let stats = lifecycle.pool.get_stats().to_xdr(&lifecycle.env);
+        let invoice = lifecycle.invoice.get(&invoice_id).to_xdr(&lifecycle.env);
+        let balances = (
+            token.balance(&lifecycle.pool_id),
+            token.balance(&lifecycle.escrow_id),
+            token.balance(&lifecycle.buyer),
+        );
+        let locked = escrow.get_locked(&invoice_id);
+        let event_count = lifecycle.env.events().all().len();
+        assert!(lifecycle.invoice.try_repay(&invoice_id).is_err());
+        assert_eq!(lifecycle.pool.get_stats().to_xdr(&lifecycle.env), stats);
+        assert_eq!(
+            lifecycle.invoice.get(&invoice_id).to_xdr(&lifecycle.env),
+            invoice
+        );
+        assert_eq!(
+            (
+                token.balance(&lifecycle.pool_id),
+                token.balance(&lifecycle.escrow_id),
+                token.balance(&lifecycle.buyer)
+            ),
+            balances
+        );
+        assert_eq!(escrow.get_locked(&invoice_id), locked);
+        assert_eq!(lifecycle.env.events().all().len(), event_count);
+        if pause_pool {
+            lifecycle.pool.unpause();
+        } else {
+            escrow.unpause();
+        }
+        assert!(lifecycle.invoice.repay(&invoice_id));
+        assert_eq!(
+            lifecycle.invoice.get_status(&invoice_id),
+            InvoiceStatus::Repaid as u32
+        );
+    }
+}
