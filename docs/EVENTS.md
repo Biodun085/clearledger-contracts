@@ -40,9 +40,22 @@ Emitted when an invoice is listed for financing.
 | **Topics** | | |
 | `topic[0]` | `Symbol` | `"invoice_listed"` |
 | `topic[1]` | `BytesN<32>` | Invoice ID |
-| **Data** | `u32` | Discount in basis points (1 bp = 0.01%) |
+| **Data** | `(u32, u64)` | `(discount_bps, expires_at)` — discount in basis points (1 bp = 0.01%) and the effective listing expiry deadline in Unix seconds |
 
-**Emitted by:** `list_for_financing()` in `contracts/invoice/src/lib.rs:335`
+`expires_at` is computed as `listed_at + expiry_window`, where `expiry_window`
+is the window configured at listing time (default `604800`, i.e. 7 days). It is
+the deadline used by `expire_listing()` to decide when the listing may be
+expired.
+
+> **Data shape change:** topics are unchanged, but the data payload changed
+> from a bare `u32` discount to the `(u32, u64)` tuple above. Indexers that
+> decoded the old `u32` payload must be updated. The window is read when the
+> invoice is listed; an admin change to `set_expiry_window` after listing
+> affects the deadline subsequently enforced by `expire_listing()`, so treat
+> `expires_at` as the deadline announced at listing time.
+
+**Emitted by:** `list_for_financing()` in `contracts/invoice/src/lib.rs` and
+`batch_list_for_financing()` per successfully listed entry
 
 ---
 

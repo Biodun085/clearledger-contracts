@@ -20,10 +20,15 @@ pub fn invoice_created(
     );
 }
 
-pub fn invoice_listed(env: &Env, invoice_id: &BytesN<32>, discount_bps: u32) {
+pub fn invoice_listed(
+    env: &Env,
+    invoice_id: &BytesN<32>,
+    discount_bps: u32,
+    expires_at: u64,
+) {
     env.events().publish(
         (Symbol::new(env, "invoice_listed"), invoice_id.clone()),
-        discount_bps,
+        (discount_bps, expires_at),
     );
 }
 

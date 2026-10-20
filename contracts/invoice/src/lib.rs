@@ -60,6 +60,10 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 /// Requests over the cap panic with [`InvoiceError::BatchSizeExceeded`].
 pub const MAX_BATCH_SIZE: u32 = 50;
 
+/// Default listing expiry window in seconds (7 days), used when the admin has
+/// not called `set_expiry_window`.
+pub const DEFAULT_EXPIRY_WINDOW: u64 = 7 * 24 * 60 * 60;
+
 #[contract]
 pub struct InvoiceContract;
 
@@ -70,6 +74,22 @@ impl InvoiceContract {
         env.storage()
             .persistent()
             .extend_ttl(&inv_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn expiry_window(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ExpiryWindow)
+            .unwrap_or(DEFAULT_EXPIRY_WINDOW)
+    }
+
+    fn listing_expiry_timestamp(env: &Env, listed_at: u64) -> u64 {
+        Self::checked_listing_expiry_timestamp(env, listed_at)
+            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::MathOverflow))
+    }
+
+    fn checked_listing_expiry_timestamp(env: &Env, listed_at: u64) -> Option<u64> {
+        listed_at.checked_add(Self::expiry_window(env))
     }
 
     /// Initializes the invoice contract with admin and registry references.
@@ -966,9 +986,11 @@ impl InvoiceContract {
         if discount_bps > 5000 {
             panic_with_error!(&env, InvoiceError::DiscountTooHigh);
         }
+        let listed_at = env.ledger().timestamp();
+        let expires_at = Self::listing_expiry_timestamp(&env, listed_at);
         invoice.status = InvoiceStatus::Listed;
         invoice.discount_bps = discount_bps;
-        invoice.listed_at = Some(env.ledger().timestamp());
+        invoice.listed_at = Some(listed_at);
         Self::save_invoice(&env, inv_key, &invoice);
         Self::extend_instance_ttl(&env);
 
@@ -978,7 +1000,7 @@ impl InvoiceContract {
             InvoiceStatus::Created,
             InvoiceStatus::Listed,
         );
-        events::invoice_listed(&env, &invoice_id, discount_bps);
+        events::invoice_listed(&env, &invoice_id, discount_bps, expires_at);
         true
     }
 
@@ -1108,9 +1130,13 @@ impl InvoiceContract {
         if discount_bps > 5000 {
             return false;
         }
+        let listed_at = env.ledger().timestamp();
+        let Some(expires_at) = Self::checked_listing_expiry_timestamp(env, listed_at) else {
+            return false;
+        };
         invoice.status = InvoiceStatus::Listed;
         invoice.discount_bps = discount_bps;
-        invoice.listed_at = Some(env.ledger().timestamp());
+        invoice.listed_at = Some(listed_at);
         Self::save_invoice(env, inv_key, &invoice);
 
         move_status_index(
@@ -1119,7 +1145,7 @@ impl InvoiceContract {
             InvoiceStatus::Created,
             InvoiceStatus::Listed,
         );
-        events::invoice_listed(env, invoice_id, discount_bps);
+        events::invoice_listed(env, invoice_id, discount_bps, expires_at);
         true
     }
 
@@ -2011,10 +2037,7 @@ impl InvoiceContract {
     /// let window = client.get_expiry_window();
     /// ```
     pub fn get_expiry_window(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::ExpiryWindow)
-            .unwrap_or(7 * 24 * 60 * 60)
+        Self::expiry_window(&env)
     }
 
     /// Expires a listing whose expiry window has passed.
@@ -2076,15 +2099,8 @@ impl InvoiceContract {
         }
 
         let listed_at = invoice.listed_at.unwrap_or(0);
-        let expiry_window = env
-            .storage()
-            .instance()
-            .get(&DataKey::ExpiryWindow)
-            .unwrap_or(7 * 24 * 60 * 60);
         let current_time = env.ledger().timestamp();
-        let deadline = listed_at
-            .checked_add(expiry_window)
-            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow));
+        let deadline = Self::listing_expiry_timestamp(&env, listed_at);
 
         if current_time < deadline {
             panic_with_error!(&env, InvoiceError::ListingNotExpired);

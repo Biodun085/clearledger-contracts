@@ -12,8 +12,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    InvoiceContract, InvoiceContractClient, InvoiceError, InvoiceStatus, MAX_BATCH_SIZE,
-    MAX_FACE_VALUE, MAX_PAGE_SIZE, TTL_EXTEND_TO, TTL_THRESHOLD,
+    InvoiceContract, InvoiceContractClient, InvoiceError, InvoiceStatus, DEFAULT_EXPIRY_WINDOW,
+    MAX_BATCH_SIZE, MAX_FACE_VALUE, MAX_PAGE_SIZE, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 
 // Default invoice parameters used across tests.
@@ -988,6 +988,7 @@ fn test_list_for_financing_discount_bps_min_boundary() {
     let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
 
     attest(&env, &client, &invoice_id);
+    let listed_at = env.ledger().timestamp();
     let result = client.list_for_financing(&invoice_id, &1);
     assert!(result);
 
@@ -1003,7 +1004,27 @@ fn test_list_for_financing_discount_bps_min_boundary() {
         topics,
         (Symbol::new(&env, "invoice_listed"), invoice_id.clone()).into_val(&env)
     );
-    assert_eq!(u32::try_from_val(&env, &data).unwrap(), 1u32);
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at + DEFAULT_EXPIRY_WINDOW)
+    );
+}
+
+#[test]
+fn test_batch_list_for_financing_expiry_overflow_reports_failed_entry() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&11);
+    env.ledger().set_timestamp(u64::MAX - 10);
+
+    let entries = vec![&env, (invoice_id.clone(), DEFAULT_DISCOUNT_BPS)];
+    let failed = client.batch_list_for_financing(&entries);
+
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed.get(0).unwrap(), invoice_id);
+    assert_eq!(client.get_status(&invoice_id), 0);
 }
 
 #[test]
@@ -1014,6 +1035,7 @@ fn test_list_for_financing_discount_bps_max_boundary() {
     let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
 
     attest(&env, &client, &invoice_id);
+    let listed_at = env.ledger().timestamp();
     let result = client.list_for_financing(&invoice_id, &5000);
     assert!(result);
 
@@ -1029,7 +1051,111 @@ fn test_list_for_financing_discount_bps_max_boundary() {
         topics,
         (Symbol::new(&env, "invoice_listed"), invoice_id.clone()).into_val(&env)
     );
-    assert_eq!(u32::try_from_val(&env, &data).unwrap(), 5000u32);
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (5000u32, listed_at + DEFAULT_EXPIRY_WINDOW)
+    );
+}
+
+#[test]
+fn test_invoice_listed_event_includes_default_expiry_deadline() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let listed_at = 1_700_000_000u64;
+    env.ledger().set_timestamp(listed_at);
+    let due_date = listed_at + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    assert_eq!(client.get(&invoice_id).listed_at, Some(listed_at));
+
+    let events = env.events().all();
+    let (contract, topics, data) = events.last().expect("expected at least one event");
+    assert_eq!(contract, client.address);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "invoice_listed"), invoice_id.clone()).into_val(&env)
+    );
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at + DEFAULT_EXPIRY_WINDOW)
+    );
+}
+
+#[test]
+fn test_invoice_listed_event_uses_configured_expiry_window() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let listed_at = 1_700_000_000u64;
+    let window = 3_600u64;
+    env.ledger().set_timestamp(listed_at);
+    client.set_expiry_window(&window);
+    let due_date = listed_at + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    let events = env.events().all();
+    let (_, _, data) = events.last().expect("expected at least one event");
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at + window)
+    );
+}
+
+#[test]
+fn test_invoice_listed_event_min_expiry_window_boundary() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let listed_at = 1_700_000_000u64;
+    env.ledger().set_timestamp(listed_at);
+    client.set_expiry_window(&0);
+    let due_date = listed_at + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    let events = env.events().all();
+    let (_, _, data) = events.last().expect("expected at least one event");
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at)
+    );
+}
+
+#[test]
+fn test_invoice_listed_event_max_expiry_window_boundary() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let listed_at = 1_700_000_000u64;
+    let window = 31_536_000u64;
+    env.ledger().set_timestamp(listed_at);
+    client.set_expiry_window(&window);
+    let due_date = listed_at + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    let events = env.events().all();
+    let (_, _, data) = events.last().expect("expected at least one event");
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at + window)
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_invoice_listed_event_expiry_overflow_panics() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.set_expiry_window(&11);
+    env.ledger().set_timestamp(u64::MAX - 10);
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
 }
 
 #[test]
@@ -4786,6 +4912,32 @@ fn test_batch_list_for_financing_emits_batch_summary_event() {
         Symbol::new(&env, "batch_invoices_listed")
     );
     assert_eq!(<(u32, u32)>::try_from_val(&env, &data).unwrap(), (1, 1));
+}
+
+#[test]
+fn test_batch_invoice_listed_event_includes_expiry_deadline() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let listed_at = 1_700_000_000u64;
+    env.ledger().set_timestamp(listed_at);
+    let due_date = listed_at + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+
+    let entries = vec![&env, (invoice_id.clone(), DEFAULT_DISCOUNT_BPS)];
+    let failed = client.batch_list_for_financing(&entries);
+    assert!(failed.is_empty());
+
+    let events = env.events().all();
+    let (contract, topics, data) = events.get(events.len() - 2).unwrap();
+    assert_eq!(contract, client.address);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "invoice_listed"), invoice_id.clone()).into_val(&env)
+    );
+    assert_eq!(
+        <(u32, u64)>::try_from_val(&env, &data).unwrap(),
+        (DEFAULT_DISCOUNT_BPS, listed_at + DEFAULT_EXPIRY_WINDOW)
+    );
 }
 
 #[test]

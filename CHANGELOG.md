@@ -44,6 +44,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `pool.initialize` accepts three new arguments: `share_name`, `share_symbol`
   and `share_decimals`
+- `invoice`: the `invoice_listed` event data is now
+  `(discount_bps, expires_at)`, where `expires_at` is the effective listing
+  expiry deadline (`listed_at + expiry_window`) in Unix seconds. Topics and
+  the contract function ABI are unchanged; indexers decoding the old bare
+  `u32` payload must be updated (#31)
 
 ### Testing
 
